@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>This app needs microphone access to transcribe your speech in real-time using FluidAudio. Your audio is processed locally and never leaves your device.</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.fluidaudio.live-transcribe-cli</string>
+    <key>CFBundleVersion</key>
+    <string>1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleName</key>
+    <string>Live Transcribe CLI</string>
+</dict>
+</plist>
