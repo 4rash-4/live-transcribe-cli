@@ -134,6 +134,32 @@ struct LiveTranscribeCLI {
                 print("🔧 Audio converter cached for M1 optimization")
             }
 
+            // M1 Optimization: Buffer pooling to reduce memory allocations
+            class BufferPool {
+                private var pool: [AVAudioPCMBuffer] = []
+                private let format: AVAudioFormat
+
+                init(format: AVAudioFormat) {
+                    self.format = format
+                }
+
+                func getBuffer(frameCapacity: AVAudioFrameCount) -> AVAudioPCMBuffer? {
+                    if let buffer = pool.popLast() {
+                        buffer.frameLength = 0 // Reset for reuse
+                        return buffer
+                    }
+                    return AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCapacity)
+                }
+
+                func returnBuffer(_ buffer: AVAudioPCMBuffer) {
+                    if pool.count < 3 { // Limit pool size
+                        pool.append(buffer)
+                    }
+                }
+            }
+
+            let bufferPool = BufferPool(format: targetFormat)
+
             // Install optimized audio tap
             input.installTap(
                 onBus: 0,
@@ -149,10 +175,7 @@ struct LiveTranscribeCLI {
                         Double(buffer.frameLength) * targetFormat.sampleRate / inputFormat.sampleRate
                     )
 
-                    guard let convertedBuffer = AVAudioPCMBuffer(
-                        pcmFormat: targetFormat,
-                        frameCapacity: outputFrameCount
-                    ) else { return }
+                    guard let convertedBuffer = bufferPool.getBuffer(frameCapacity: outputFrameCount) else { return }
 
                     var error: NSError?
                     let status = converter.convert(to: convertedBuffer, error: &error) { _, outStatus in
@@ -169,8 +192,12 @@ struct LiveTranscribeCLI {
                 }
 
                 // Stream to FluidAudio
-                Task {
+                Task.detached {
                     await streamingManager.streamAudio(bufferToStream)
+                    // Return buffer to pool after streaming
+                    if bufferToStream !== buffer { // Only return converted buffers
+                        bufferPool.returnBuffer(bufferToStream)
+                    }
                 }
             }
 
