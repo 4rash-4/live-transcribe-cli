@@ -1,14 +1,23 @@
 import Foundation
 import AVFoundation
 import FluidAudio
+import Accelerate
 
-@main
-struct LiveTranscribeCLI {
-    static func main() async {
+func main() async {
         do {
             print("🎤 Live Transcribe CLI - FluidAudio (M1 Optimized)")
             print("===================================================")
             print("Press Ctrl+C to stop")
+            print("")
+
+            // Brick 1: Show floating HUD window (on main thread)
+            let hudController = await MainActor.run {
+                let controller = FloatingHUDController()
+                controller.show()
+                print("🪟 Floating HUD window displayed")
+                return controller
+            }
+            _ = hudController // Keep reference alive
             print("")
 
             // M1 Optimization: Display system info
@@ -115,8 +124,32 @@ struct LiveTranscribeCLI {
                         firstTokenReceived = true
                     }
 
+                    // Terminal output (keep for now)
                     if update.isConfirmed {
                         print("✅ \(update.text) (conf: \(String(format: "%.2f", update.confidence)))")
+
+                        // Feed to floating HUD with derived metrics
+                        let silenceRatio = Double(1.0 - update.confidence) // approximate
+                        let speakingRate = Double(update.text.split(separator: " ").count) / 2.0 // rough estimate
+
+                        hudController.appendTranscript(
+                            update.text,
+                            confidence: Double(update.confidence),
+                            silenceRatio: silenceRatio,
+                            speakingRate: speakingRate
+                        )
+
+                        // Also log to JSON
+                        let entry = LogEntry(
+                            ts: Date(),
+                            driftHue: 0.58 - (silenceRatio * 0.25),
+                            transcript: update.text,
+                            tokenMs: [], // tokenTimings not available in StreamingTranscriptionUpdate
+                            pauseMs: 0, // would need VAD integration
+                            vadConfidence: Double(update.confidence),
+                            wordCount: update.text.split(separator: " ").count
+                        )
+                        TranscriptLogger.shared.append(entry: entry)
                     } else {
                         print("🔄 \(update.text) (conf: \(String(format: "%.2f", update.confidence)))")
                     }
@@ -160,6 +193,10 @@ struct LiveTranscribeCLI {
 
             let bufferPool = BufferPool(format: targetFormat)
 
+
+            // Create classy Unicode TUI renderer
+            let tui = ClassyTUI()
+
             // Install optimized audio tap
             input.installTap(
                 onBus: 0,
@@ -189,6 +226,18 @@ struct LiveTranscribeCLI {
                     }
 
                     bufferToStream = convertedBuffer
+                }
+
+                // TUI rendering with real live data
+                Task.detached {
+                    let spectro = fft512(bufferToStream)
+                    var meanSquare: Float = 0
+                    vDSP_measqv(bufferToStream.floatChannelData![0], 1, &meanSquare, vDSP_Length(bufferToStream.frameLength))
+                    let rms = 20 * log10(max(1e-6, sqrt(meanSquare)))
+                    let voice = (rms < -40) ? "Whisper" : "Normal"
+                    let mem = Double(ProcessInfo.processInfo.physicalMemory) / 1_024 / 1_024 / 1_024
+                    let temp = readPackageTemp()
+                    tui.render(spectro: spectro, level: rms, voice: voice, memMB: mem, tempC: temp)
                 }
 
                 // Stream to FluidAudio
@@ -256,14 +305,15 @@ struct LiveTranscribeCLI {
         }
     }
 
-    // Helper function for thermal state descriptions
-    static func thermalStateDescription(_ state: ProcessInfo.ThermalState) -> String {
-        switch state {
-        case .nominal: return "Nominal (optimal)"
-        case .fair: return "Fair (slight throttling)"
-        case .serious: return "Serious (throttling)"
-        case .critical: return "Critical (heavy throttling)"
-        @unknown default: return "Unknown"
-        }
+// Helper function for thermal state descriptions
+func thermalStateDescription(_ state: ProcessInfo.ThermalState) -> String {
+    switch state {
+    case .nominal: return "Nominal (optimal)"
+    case .fair: return "Fair (slight throttling)"
+    case .serious: return "Serious (throttling)"
+    case .critical: return "Critical (heavy throttling)"
+    @unknown default: return "Unknown"
     }
 }
+
+await main()

@@ -16,7 +16,8 @@ let package = Package(
       dependencies: [
         .product(name: "FluidAudio", package: "FluidAudio")
       ],
-      path: "Sources/LiveTranscribeCLI"
+      path: "Sources/LiveTranscribeCLI",
+      exclude: ["Info.plist"]
     )
   ]
 )
