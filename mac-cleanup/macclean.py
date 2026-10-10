@@ -215,14 +215,39 @@ def discover(warnings):
     return projects, loose, bundles
 
 
+SECRET_RE = re.compile(
+    r"^(\.env(\..+)?|.*\.(p12|pfx|keystore|jks|kdbx)|id_(rsa|dsa|ecdsa|ed25519)|credentials(\..+)?|"
+    r".*secrets?(\..+)?|\.npmrc|\.pypirc|\.netrc|wallet.*\.json|.*private.*key.*)$", re.I)
+SECRET_SAFE_RE = re.compile(r"\.(example|sample|template|dist|md|txt)$", re.I)
+NOT_SECRET_DIRS = ("node_modules", "site-packages", os.sep + ".git" + os.sep, os.sep + "venv" + os.sep)
+
+
+def is_secret_file(dp, f):
+    """Filename heuristics for credentials that should not be uploaded to a cloud drive."""
+    if any(x in dp + os.sep for x in NOT_SECRET_DIRS):
+        return False
+    if f.lower().endswith((".pem", ".key")):  # PEM private keys vs. e.g. Keynote files
+        try:
+            with open(os.path.join(dp, f), "rb") as fh:
+                return b"PRIVATE KEY" in fh.read(400)
+        except OSError:
+            return False
+    if SECRET_SAFE_RE.search(f):
+        return False
+    return bool(SECRET_RE.match(f))
+
+
 def walk_stats(path):
     files = total = 0
     last = 0.0
     readme = False
+    secrets = []
     for dp, _dns, fns in os.walk(path):
         for f in fns:
             if f == ".DS_Store":
                 continue
+            if len(secrets) < 5 and is_secret_file(dp, f):
+                secrets.append(os.path.relpath(os.path.join(dp, f), path))
             try:
                 st = os.lstat(os.path.join(dp, f))
             except OSError:
@@ -232,7 +257,7 @@ def walk_stats(path):
             last = max(last, st.st_mtime)
             if f.lower().startswith("readme"):
                 readme = True
-    return {"files": files, "bytes": total, "last": last, "readme": readme}
+    return {"files": files, "bytes": total, "last": last, "readme": readme, "secrets": secrets}
 
 
 def git_ignored(project, path):
@@ -241,7 +266,7 @@ def git_ignored(project, path):
 
 def analyse_project(path, verify):
     p = {"path": path, "files": 0, "src": 0, "last_file": 0.0, "readme": False,
-         "artifacts": [], "git": None}
+         "artifacts": [], "git": None, "secrets": [], "ignored_local": []}
     is_git = os.path.exists(os.path.join(path, ".git"))
     top_names = set(os.listdir(path)) if os.path.isdir(path) else set()
     has_manifest = any(m in top_names for m in PY_MANIFESTS)
@@ -271,6 +296,8 @@ def analyse_project(path, verify):
         for f in fns:
             if f == ".DS_Store":
                 continue
+            if len(p["secrets"]) < 5 and is_secret_file(dp, f):
+                p["secrets"].append(os.path.relpath(os.path.join(dp, f), path))
             try:
                 st = os.lstat(os.path.join(dp, f))
             except OSError:
@@ -284,6 +311,13 @@ def analyse_project(path, verify):
     if is_git:
         p["git"] = git_info(path, verify)
         p["last"] = max(p["last"], p["git"].get("last_commit") or 0)
+        arts = [os.path.relpath(x[0], path) for x in p["artifacts"]]
+        for e in p["git"].get("ignored", []):
+            e = e.rstrip("/")
+            if (any(e == x or e.startswith(x + os.sep) for x in arts) or e.endswith((".pyc", ".DS_Store"))
+                    or "__pycache__" in e):
+                continue
+            p["ignored_local"].append(e)
     return p
 
 
@@ -292,11 +326,13 @@ def git_info(path, verify):
         return run(["git", "-C", path] + list(a), env=GIT_ENV, timeout=90)
     info = {"error": None, "dirty": 0, "stash": 0, "unpushed": 0, "remotes": [], "commits": 0,
             "remote_ok": None, "last_commit": 0}
-    rc, out = g("status", "--porcelain")
+    rc, out = g("status", "--porcelain", "--ignored")
     if rc != 0:
         info["error"] = "git status failed"
         return info
-    info["dirty"] = len(out.splitlines())
+    lines = out.splitlines()
+    info["dirty"] = len([l for l in lines if not l.startswith("!!")])
+    info["ignored"] = [l[3:] for l in lines if l.startswith("!!")]
     info["remotes"] = g("remote")[1].split()
     rc, out = g("rev-list", "--count", "HEAD")
     info["commits"] = int(out) if rc == 0 and out.strip().isdigit() else 0
@@ -358,6 +394,10 @@ def classify(p, a):
         if g["remotes"]:
             if a.verify_remotes and not g["remote_ok"]:
                 return "REVIEW", "remote unreachable/deleted - this may be the only copy"
+            if p["ignored_local"]:
+                il = p["ignored_local"]
+                return "REVIEW", "clean and pushed BUT %d git-ignored local-only item(s) not on the remote: %s" % (
+                    len(il), ", ".join(il[:3]))
             if idle >= a.stale_days:
                 note = "" if g["remote_ok"] else " (remote not verified; use --verify-remotes)"
                 return "QUARANTINE", "clean, fully pushed to '%s', idle %dd - re-clone anytime%s" % (
@@ -438,7 +478,8 @@ def scan(a):
         if idle is not None and idle >= a.review_days:
             act, reason = classify(p, a)
             rows.append(dict(action=act, kind="project", path=p["path"], bytes=p["bytes"],
-                             idle=idle, reason=reason))
+                             idle=idle, reason=reason, secrets=p["secrets"],
+                             unsaved=reason.startswith("HAS UNSAVED")))
 
     log("[4/5] loose folders, files, bundles, duplicates ...")
     proj_set = set(projects)
@@ -460,7 +501,8 @@ def scan(a):
                 scratch = bool(SCRATCH_RE.search(os.path.basename(k)))
                 act = "QUARANTINE" if scratch and score >= 80 else "REVIEW"
                 rows.append(dict(action=act, kind="folder", path=k, bytes=s["bytes"], idle=idle,
-                                 reason="no project markers; junk score %d: %s" % (score, ", ".join(why))))
+                                 reason="no project markers; junk score %d: %s" % (score, ", ".join(why)),
+                                 secrets=s["secrets"], unsaved=False))
     bsz = du_bytes(bundles)
     for b in bundles:
         if bsz.get(b, 0) >= a.big_mb * MB:
@@ -520,8 +562,91 @@ def scan(a):
 
     log("[5/5] measuring your home directory for the report ...")
     breakdown = home_breakdown()
-    write_outputs(a, out, rows, stats, breakdown, warnings, len(plist))
+    ctx = finalize(a, rows, plist, sizes, warnings)
+    write_outputs(a, out, ctx["rows"], stats, breakdown, warnings, len(plist), ctx)
     return out
+
+
+def find_clouds():
+    """Locally synced cloud folders: name -> path."""
+    found = {}
+    icloud = os.path.join(HOME, "Library", "Mobile Documents", "com~apple~CloudDocs")
+    if os.path.isdir(icloud):
+        found["icloud"] = icloud
+    cs = os.path.join(HOME, "Library", "CloudStorage")
+    cands = []
+    if os.path.isdir(cs):
+        cands += [os.path.join(cs, n) for n in sorted(os.listdir(cs)) if n.startswith("OneDrive")]
+    cands += [os.path.join(HOME, n) for n in sorted(os.listdir(HOME)) if n.startswith("OneDrive")]
+    for c in cands:
+        if os.path.isdir(c):
+            found.setdefault("onedrive", c)
+    return found
+
+
+def resolve_cloud(spec, warnings):
+    clouds = find_clouds()
+    if not spec or spec == "none":
+        return None
+    if spec == "auto":
+        for k in ("onedrive", "icloud"):
+            if k in clouds:
+                return clouds[k]
+        warnings.append("no OneDrive or iCloud Drive folder found - sign in and let it sync, or pass --cloud PATH")
+        return None
+    if spec in clouds:
+        return clouds[spec]
+    if os.path.isdir(os.path.expanduser(spec)):
+        return os.path.realpath(os.path.expanduser(spec))
+    warnings.append("cloud folder '%s' not found (detected: %s)" % (spec, ", ".join(clouds) or "none"))
+    return None
+
+
+def finalize(a, rows, plist, sizes, warnings):
+    """Apply the keep list, cloud offload routing and the free-space target."""
+    keep = [k.lower() for k in a.keep]
+    kept_projects = [p for p in plist if any(k in p["path"].lower() for k in keep)]
+    kept_paths = [p["path"] for p in kept_projects]
+
+    def protected(path):
+        low = path.lower()
+        return (any(k in low for k in keep)
+                or any(kp.startswith(path + os.sep) or kp == path for kp in kept_paths))
+    rows = [r for r in rows if not protected(r["path"])]
+    cloud = resolve_cloud(a.cloud, warnings)
+    if cloud:
+        for r in rows:
+            if r["kind"] not in ("project", "folder"):
+                continue
+            sec = r.get("secrets")
+            if sec and not a.include_secrets:
+                if r["action"] in ("QUARANTINE", "OFFLOAD"):
+                    r["action"] = "REVIEW"
+                r["reason"] += " | NOT UPLOADABLE: contains credentials (%s)" % ", ".join(sec[:3])
+            elif r["action"] == "QUARANTINE":
+                r["action"] = "OFFLOAD"
+                r["reason"] += " | archive to cloud"
+    shortfall = None
+    if a.target_gb:
+        target = a.target_gb * 1024 * MB
+        got = sum(r["bytes"] for r in rows if r["action"] in ("DELETE", "QUARANTINE", "OFFLOAD"))
+        if cloud and got < target:
+            idle_rank = lambda r: 3 if r["idle"] >= 365 else 2 if r["idle"] >= 180 else 1 if r["idle"] >= 60 else 0
+            cands = [r for r in rows if r["action"] == "REVIEW" and r["kind"] in ("project", "folder")
+                     and not (r.get("secrets") and not a.include_secrets)]
+            cands.sort(key=lambda r: (r.get("unsaved", False), -idle_rank(r), -r["bytes"]))
+            for r in cands:
+                if got >= target:
+                    break
+                r["action"] = "OFFLOAD"
+                r["reason"] = "[needed for %g GB target] %s" % (a.target_gb, r["reason"])
+                got += r["bytes"]
+        if got < target:
+            shortfall = target - got
+    kept_info = [(p["path"], p["src"] + sum(sizes.get(x[0], 0) for x in p["artifacts"])) for p in kept_projects]
+    kept_roots = sorted(set(kept_paths))
+    return {"rows": rows, "cloud": cloud, "kept": kept_info, "kept_paths": kept_roots,
+            "shortfall": shortfall, "keep": a.keep}
 
 
 def hash_file(path):
@@ -547,7 +672,7 @@ def home_breakdown():
     return {"home": top, "library": lib_top}
 
 
-ORDER = {"DELETE": 0, "QUARANTINE": 1, "REVIEW": 2}
+ORDER = {"DELETE": 0, "OFFLOAD": 1, "QUARANTINE": 2, "REVIEW": 3}
 
 
 def volume_line():
@@ -559,12 +684,18 @@ def volume_line():
         return "n/a"
 
 
-def write_outputs(a, out, rows, stats, breakdown, warnings, nproj):
+def write_outputs(a, out, rows, stats, breakdown, warnings, nproj, ctx):
     rows.sort(key=lambda r: (ORDER[r["action"]], -r["bytes"]))
     plan = os.path.join(out, "plan.tsv")
     with open(plan, "w", newline="") as f:
         f.write("# macclean plan v1 scanned_at=%d home=%s\n" % (NOW, HOME))
-        f.write("# Set the first column to DELETE, QUARANTINE or KEEP. REVIEW/KEEP rows are ignored by `apply`.\n")
+        for k in ctx["keep"]:
+            f.write("# keep=%s\n" % k)
+        for kp in ctx["kept_paths"]:
+            f.write("# keep_path=%s\n" % kp)
+        if ctx["cloud"]:
+            f.write("# cloud=%s\n" % ctx["cloud"])
+        f.write("# Set the first column to DELETE, OFFLOAD, QUARANTINE or KEEP. REVIEW/KEEP rows are ignored by `apply`.\n")
         w = csv.writer(f, delimiter="\t", lineterminator="\n")
         w.writerow(["action", "size", "bytes", "kind", "idle_days", "path", "reason"])
         for r in rows:
@@ -578,9 +709,29 @@ def write_outputs(a, out, rows, stats, breakdown, warnings, nproj):
     L.append("Volume: **%s**\n" % volume_line())
     L.append("| Bucket | Reclaimable | Meaning |\n|---|---|---|")
     L.append("| DELETE | **%s** | regenerable caches/build output - safe to remove for real |" % fmt(tot["DELETE"]))
-    L.append("| QUARANTINE | **%s** | stale projects/installers - moved aside, `purge` frees the space later |" % fmt(tot["QUARANTINE"]))
+    L.append("| OFFLOAD | **%s** | archived (tar.gz) into `%s`, verified, then the local copy is removed |" % (
+        fmt(tot["OFFLOAD"]), (ctx["cloud"] or "no cloud folder found").replace(HOME, "~")))
+    L.append("| QUARANTINE | **%s** | junk/installers - moved aside, `purge` frees the space later |" % fmt(tot["QUARANTINE"]))
     L.append("| REVIEW | %s | needs your judgement; flip to QUARANTINE/DELETE in `plan.tsv` |\n" % fmt(tot["REVIEW"]))
 
+    if a.target_gb:
+        got = tot["DELETE"] + tot["OFFLOAD"] + tot["QUARANTINE"]
+        L.append("**Target %g GB: plan reclaims %s%s.**\n" % (
+            a.target_gb, fmt(got), "" if not ctx["shortfall"] else
+            " - SHORT by %s; see the REVIEW rows (Docker, Ollama, simulators, backups) or lower --review-days" % fmt(ctx["shortfall"])))
+    if ctx["keep"]:
+        L.append("## Protected (never touched)\n")
+        L.append("Anything whose path contains: %s\n" % ", ".join("`%s`" % k for k in ctx["keep"]))
+        for p, b in ctx["kept"]:
+            L.append("- `%s` (%s incl. build dirs)" % (p.replace(HOME, "~"), fmt(b)))
+        L.append("")
+    if ctx["cloud"]:
+        nsec = [r for r in rows if r["kind"] in ("project", "folder") and r.get("secrets")]
+        if nsec:
+            L.append("## Not uploaded because they contain credentials\n")
+            for r in nsec:
+                L.append("- `%s` (%s): %s" % (r["path"].replace(HOME, "~"), fmt(r["bytes"]), ", ".join(r["secrets"][:3])))
+            L.append("\nMove the secrets out (or rotate them) and rescan, or pass `--include-secrets` to upload anyway.\n")
     L.append("## Where your space is\n")
     L.append("| Size | Home item |\n|---:|---|")
     for p, b in breakdown["home"]:
@@ -631,6 +782,7 @@ def write_outputs(a, out, rows, stats, breakdown, warnings, nproj):
 
     print("\nDone. Nothing has been changed.")
     print("  DELETE      %10s" % fmt(tot["DELETE"]))
+    print("  OFFLOAD     %10s" % fmt(tot["OFFLOAD"]))
     print("  QUARANTINE  %10s" % fmt(tot["QUARANTINE"]))
     print("  REVIEW      %10s" % fmt(tot["REVIEW"]))
     print("\nReport: %s/report.md\nPlan:   %s\n" % (out, plan))
@@ -690,22 +842,98 @@ def rm(path):
 
 
 def read_plan(path):
+    meta = {"keep": [], "keep_path": [], "cloud": None}
+    body = []
     with open(path, newline="") as f:
-        lines = [l for l in f if not l.startswith("#")]
-    return list(csv.DictReader(lines, delimiter="\t"))
+        for l in f:
+            if l.startswith("#"):
+                m = re.match(r"# (keep|keep_path|cloud)=(.*)$", l.rstrip("\n"))
+                if m:
+                    if m.group(1) == "cloud":
+                        meta["cloud"] = m.group(2)
+                    else:
+                        meta[m.group(1)].append(m.group(2))
+            else:
+                body.append(l)
+    return meta, list(csv.DictReader(body, delimiter="\t"))
+
+
+REGISTRY = os.path.join(STATE, "offloads.tsv")
+
+
+def safe_name(rel):
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", rel.replace(os.sep, "__")).strip(" .")
+    if len(name) > 120:
+        name = name[:100] + "-" + hashlib.sha1(rel.encode()).hexdigest()[:8]
+    return name
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def make_archive(src, cloud, stamp):
+    """tar.gz src into <cloud>/MacArchive/<stamp>/, verify it, return (archive, sha256, bytes)."""
+    parent, name = os.path.dirname(src), os.path.basename(src)
+    info = analyse_project(src, False)
+    skip = [os.path.relpath(f, parent) for f, act, _ in info["artifacts"]
+            if act == "DELETE" and not re.search(r"[\[\]*?]", f)]
+    final_dir = os.path.join(cloud, "MacArchive", stamp)
+    arch_name = safe_name(os.path.relpath(src, HOME)) + ".tar.gz"
+    stage_dir = os.path.join(STATE, "staging")
+    os.makedirs(stage_dir, exist_ok=True)
+    os.makedirs(final_dir, exist_ok=True)
+    stage = os.path.join(stage_dir, arch_name)
+    cmd = ["tar", "-czf", stage, "--exclude", ".DS_Store"]
+    for e in skip:
+        cmd += ["--exclude", e]
+    cmd += ["-C", parent, name]
+    r = subprocess.run(cmd, stderr=subprocess.PIPE, universal_newlines=True)
+    errs = [l for l in r.stderr.splitlines() if l.strip() and "changed as we read" not in l]
+    if r.returncode != 0 and (r.returncode != 1 or errs):
+        raise OSError("tar failed (exit %d): %s" % (r.returncode, "; ".join(errs[:2])))
+    if subprocess.run(["gzip", "-t", stage]).returncode != 0:
+        raise OSError("gzip integrity check failed")
+    rc, listing = run(["tar", "-tzf", stage], timeout=3600)
+    if rc != 0 or not listing.strip():
+        raise OSError("archive listing failed")
+    sha = sha256_file(stage)
+    size = os.path.getsize(stage)
+    dest = os.path.join(final_dir, arch_name)
+    shutil.move(stage, dest)
+    if os.path.getsize(dest) != size:
+        raise OSError("size mismatch after moving into cloud folder")
+    with open(dest + ".sha256", "w") as f:
+        f.write("%s  %s\n" % (sha, arch_name))
+    return dest, sha, size
 
 
 def apply(a):
-    rows = read_plan(a.plan)
-    todo = [r for r in rows if (r.get("action") or "").strip().upper() in ("DELETE", "QUARANTINE")]
-    todo.sort(key=lambda r: (0 if r["action"].strip().upper() == "DELETE" else 1, -len(r["path"])))
+    meta, rows = read_plan(a.plan)
+    cloud = os.path.realpath(os.path.expanduser(a.cloud_dir)) if a.cloud_dir else meta["cloud"]
+    keep = [k.lower() for k in meta["keep"]]
+    todo = [r for r in rows if (r.get("action") or "").strip().upper() in ("DELETE", "OFFLOAD", "QUARANTINE")]
+    rank = {"DELETE": 0, "QUARANTINE": 1, "OFFLOAD": 2}
+    todo.sort(key=lambda r: (rank[r["action"].strip().upper()], -len(r["path"]) if r["action"].strip().upper() != "OFFLOAD" else 0))
     ok, refused = [], []
     for r in todo:
-        p = r["path"]
+        p, act = r["path"], r["action"].strip().upper()
         why = path_problem(p)
+        if not why and (any(k in p.lower() for k in keep)
+                        or any(kp.startswith(p + os.sep) or kp == p for kp in meta["keep_path"])):
+            why = "protected by --keep"
+        if not why and cloud and (p == cloud or p.startswith(cloud + os.sep)):
+            why = "inside the cloud folder"
         if not why and not os.path.lexists(p):
             why = "already gone"
-        if not why and r["kind"] == "project":
+        if not why and act == "OFFLOAD":
+            if not cloud or not os.path.isdir(cloud):
+                why = "no cloud folder (plan header or --cloud-dir)"
+        if not why and r["kind"] == "project" and act != "OFFLOAD":
             why = recheck_git(p)
         (refused if why else ok).append((r, why))
     total = sum(int(r["bytes"]) for r, _ in ok)
@@ -714,34 +942,74 @@ def apply(a):
         print("  SKIP %s -> %s" % (r["path"].replace(HOME, "~"), why))
     for r, _ in ok:
         print("  %-10s %9s  %s" % (r["action"].strip().upper(), r["size"], r["path"].replace(HOME, "~")))
+    if any(r["action"].strip().upper() == "OFFLOAD" for r, _ in ok):
+        print("\nOFFLOAD target: %s/MacArchive  (%s the local original afterwards)" % (
+            cloud.replace(HOME, "~"), "DELETES" if a.free_now else "quarantines"))
     if not a.yes:
         print("\nDry run. Nothing changed. Quit the apps whose caches are listed, then re-run with --yes.")
         return
-    batch = os.path.join(QDIR, datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
-    freed = moved = 0
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    batch = os.path.join(QDIR, stamp)
+    freed = moved = offloaded = 0
     for r, _ in ok:
         p, act = r["path"], r["action"].strip().upper()
         try:
             if act == "DELETE":
                 rm(p)
                 freed += int(r["bytes"])
-            else:
-                os.makedirs(batch, exist_ok=True)
-                dest = os.path.join(batch, os.path.relpath(p, HOME).replace(os.sep, "__"))
-                shutil.move(p, dest)
-                with open(os.path.join(batch, "MANIFEST.tsv"), "a") as m:
-                    m.write("%s\t%s\n" % (p, dest))
-                moved += int(r["bytes"])
-        except OSError as e:
+                continue
+            if act == "OFFLOAD":
+                free = shutil.disk_usage(HOME).free
+                need = int(r["bytes"]) + (1 << 30)
+                if free < need and not a.free_now:
+                    print("  SKIP %s: need ~%s free to stage the archive, have %s (try --free-now, or purge first)" % (
+                        p.replace(HOME, "~"), fmt(need), fmt(free)))
+                    continue
+                print("  archiving %s ..." % p.replace(HOME, "~"))
+                arch, sha, asz = make_archive(p, cloud, stamp)
+                with open(REGISTRY, "a") as reg:
+                    reg.write("%d\t%s\t%s\t%s\t%d\n" % (NOW, p, arch, sha, int(r["bytes"])))
+                if a.free_now:
+                    rm(p)
+                    freed += int(r["bytes"])
+                    offloaded += int(r["bytes"])
+                    continue
+            os.makedirs(batch, exist_ok=True)
+            dest = os.path.join(batch, os.path.relpath(p, HOME).replace(os.sep, "__"))
+            shutil.move(p, dest)
+            with open(os.path.join(batch, "MANIFEST.tsv"), "a") as m:
+                m.write("%s\t%s\t%s\t%s\n" % (p, dest, arch if act == "OFFLOAD" else "", sha if act == "OFFLOAD" else ""))
+            moved += int(r["bytes"])
+            if act == "OFFLOAD":
+                offloaded += int(r["bytes"])
+        except (OSError, subprocess.SubprocessError) as e:
             print("  FAILED %s: %s" % (p, e))
-    print("\nDeleted %s. Quarantined %s (space is freed by `purge`)." % (fmt(freed), fmt(moved)))
-    if moved:
+    print("\nDeleted %s. Quarantined %s (space is freed by `purge`). Of this, %s was archived to the cloud folder." % (
+        fmt(freed), fmt(moved), fmt(offloaded)))
+    if offloaded:
+        print("\nNEXT:\n 1. Let OneDrive/iCloud finish uploading (no spinner/pending badge on the MacArchive folder).")
+        print("    Check the files in the web UI (onedrive.live.com / icloud.com).")
+        if moved:
+            print(" 2. python3 %s purge --yes --synced     # deletes the quarantined originals after re-verifying the archives" % sys.argv[0])
+        print(" 3. Free the local copy of the archives: Finder > right-click MacArchive >"
+              " 'Free Up Space' (OneDrive) / 'Remove Download' (iCloud), or: python3 %s evict" % sys.argv[0])
+    elif moved:
         print("Undo with: python3 %s restore --batch %s\nFree it with: python3 %s purge --yes" % (
-            sys.argv[0], os.path.basename(batch), sys.argv[0]))
+            sys.argv[0], stamp, sys.argv[0]))
 
 
 def batches():
     return sorted(d for d in os.listdir(QDIR)) if os.path.isdir(QDIR) else []
+
+
+def manifest(batch):
+    man = os.path.join(QDIR, batch, "MANIFEST.tsv")
+    out = []
+    if os.path.exists(man):
+        for line in open(man):
+            parts = (line.rstrip("\n").split("\t") + ["", ""])[:4]
+            out.append(parts)
+    return out
 
 
 def purge(a):
@@ -750,6 +1018,21 @@ def purge(a):
     for b in batches():
         p = os.path.join(QDIR, b)
         if os.path.getmtime(p) > cutoff:
+            continue
+        archives = [(m[2], m[3]) for m in manifest(b) if m[2]]
+        if archives and not a.synced:
+            print("SKIP %s: contains items archived to the cloud. Confirm the upload finished, then use --synced." % b)
+            continue
+        bad = []
+        if archives and a.yes:
+            for arch, sha in archives:
+                try:
+                    if sha256_file(arch) != sha:
+                        bad.append(arch)
+                except OSError:
+                    bad.append(arch)
+        if bad:
+            print("REFUSING to purge %s: archive missing or corrupt:\n  %s" % (b, "\n  ".join(bad)))
             continue
         size = du_bytes([p]).get(p, 0)
         tot += size
@@ -763,11 +1046,7 @@ def restore(a):
     for b in batches():
         if a.batch and b != a.batch:
             continue
-        man = os.path.join(QDIR, b, "MANIFEST.tsv")
-        if not os.path.exists(man):
-            continue
-        for line in open(man):
-            orig, dest = line.rstrip("\n").split("\t")
+        for orig, dest, _arch, _sha in manifest(b):
             if not os.path.lexists(dest):
                 continue
             if os.path.lexists(orig):
@@ -778,27 +1057,85 @@ def restore(a):
             print("restored %s" % orig.replace(HOME, "~"))
 
 
+def read_registry():
+    if not os.path.exists(REGISTRY):
+        return []
+    return [l.rstrip("\n").split("\t") for l in open(REGISTRY) if l.count("\t") >= 4]
+
+
+def evict(a):
+    """Ask iCloud to drop the local copy of uploaded archives (OneDrive: use Finder 'Free Up Space')."""
+    n = 0
+    for _ts, _src, arch, _sha, _b in read_registry():
+        if "/Mobile Documents/" in arch and os.path.exists(arch):
+            if shutil.which("brctl") and run(["brctl", "evict", arch])[0] == 0:
+                n += 1
+    print("Asked iCloud to evict %d archive(s). Items not yet uploaded are kept by iCloud." % n)
+    print("For OneDrive: Finder > right-click the MacArchive folder > 'Free Up Space'.")
+
+
+def unarchive(a):
+    arch = os.path.abspath(os.path.expanduser(a.archive))
+    side = arch + ".sha256"
+    if os.path.exists(side):
+        want = open(side).read().split()[0]
+        if sha256_file(arch) != want:
+            sys.exit("checksum mismatch - archive is damaged, refusing to extract")
+    dest = os.path.abspath(os.path.expanduser(a.to or HOME))
+    os.makedirs(dest, exist_ok=True)
+    top = run(["tar", "-tzf", arch], timeout=3600)[1].splitlines()
+    if not top:
+        sys.exit("cannot read archive")
+    root = os.path.join(dest, top[0].split("/")[0])
+    if os.path.exists(root):
+        sys.exit("%s already exists; use --to another directory" % root)
+    if subprocess.run(["tar", "-xzf", arch, "-C", dest]).returncode != 0:
+        sys.exit("extract failed")
+    print("restored to %s (rebuild node_modules/venvs with the usual install commands)" % root)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("scan", help="read-only scan")
     s.add_argument("--out")
-    s.add_argument("--stale-days", type=int, default=180, help="clean+pushed repos idle this long are quarantine candidates")
-    s.add_argument("--review-days", type=int, default=60, help="list projects/folders idle at least this long")
-    s.add_argument("--artifact-days", type=int, default=30, help="remove node_modules/venv/etc. from projects idle this long")
+    s.add_argument("--keep", action="append", default=None,
+                   help="extra case-insensitive path substring that is NEVER touched (repeatable; 'nobitex' is always kept)")
+    s.add_argument("--cloud", default="auto",
+                   help="where to offload: auto | onedrive | icloud | none | /path (default auto, OneDrive first)")
+    s.add_argument("--target-gb", type=float, help="free at least this much; escalates stale projects to OFFLOAD until met")
+    s.add_argument("--include-secrets", action="store_true", help="allow uploading projects that contain .env/keys/credentials")
+    s.add_argument("--stale-days", type=int, help="clean+pushed repos idle this long are candidates (default 180; 30 with --target-gb)")
+    s.add_argument("--review-days", type=int, help="list projects/folders idle at least this long (default 60; 14 with --target-gb)")
+    s.add_argument("--artifact-days", type=int, help="remove node_modules/venv/etc. from projects idle this long (default 30; 14 with --target-gb)")
     s.add_argument("--min-mb", type=int, default=20, help="ignore items smaller than this")
     s.add_argument("--big-mb", type=int, default=500, help="flag single files/bundles this big")
     s.add_argument("--verify-remotes", action="store_true", help="git ls-remote each repo (network) before trusting its remote")
     p = sub.add_parser("apply", help="act on a reviewed plan")
     p.add_argument("plan")
     p.add_argument("--yes", action="store_true")
+    p.add_argument("--cloud-dir", help="override the cloud folder recorded in the plan")
+    p.add_argument("--free-now", action="store_true",
+                   help="delete originals right after their archive is verified (no quarantine copy; for tight disks)")
     q = sub.add_parser("purge", help="permanently delete quarantined items")
     q.add_argument("--older-than", type=int, default=0, help="days (default: everything)")
     q.add_argument("--yes", action="store_true")
+    q.add_argument("--synced", action="store_true", help="I confirmed the cloud archives finished uploading")
     r = sub.add_parser("restore", help="move quarantined items back")
     r.add_argument("--batch")
+    sub.add_parser("evict", help="ask iCloud to drop local copies of uploaded archives")
+    u = sub.add_parser("unarchive", help="restore a cloud archive")
+    u.add_argument("archive")
+    u.add_argument("--to", help="destination directory (default: your home)")
     a = ap.parse_args()
-    {"scan": scan, "apply": apply, "purge": purge, "restore": restore}[a.cmd](a)
+    if a.cmd == "scan":
+        a.keep = ["nobitex"] + [k for k in (a.keep or []) if k.lower() != "nobitex"]
+        t = a.target_gb is not None
+        a.stale_days = a.stale_days if a.stale_days is not None else (30 if t else 180)
+        a.review_days = a.review_days if a.review_days is not None else (14 if t else 60)
+        a.artifact_days = a.artifact_days if a.artifact_days is not None else (14 if t else 30)
+    {"scan": scan, "apply": apply, "purge": purge, "restore": restore, "evict": evict,
+     "unarchive": unarchive}[a.cmd](a)
 
 
 if __name__ == "__main__":
